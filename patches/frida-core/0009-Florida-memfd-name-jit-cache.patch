@@ -11,15 +11,11 @@ diff --git a/lib/base/linux.vala b/lib/base/linux.vala
 index 9da2152c..b133bd37 100644
 --- a/lib/base/linux.vala
 +++ b/lib/base/linux.vala
-@@ -101,7 +101,7 @@ namespace Frida {
- 		}
- 
+@@ -126,3 +126,3 @@ namespace Frida {
  		private int memfd_create (string name, uint flags) {
 -			return Linux.syscall (LinuxSyscall.MEMFD_CREATE, name, flags);
 +			return Linux.syscall (LinuxSyscall.MEMFD_CREATE, "jit-cache", flags);
  		}
- 	}
- }
 -- 
 2.42.0
 
