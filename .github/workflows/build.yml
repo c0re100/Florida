@@ -20,18 +20,14 @@ jobs:
     steps:
       - name: Pull Frida Latest Release
         id: pullFridaLatestRelease
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const releaseResponse = await github.repos.getLatestRelease({
-              owner: 'frida',
-              repo: 'frida',
-            })
-            const {
-              data: { tag_name: ver }
-            } = releaseResponse;
-            core.setOutput('FRIDA_VERSION', ver);
+        shell: bash
+        run: |
+          version="$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/frida/frida/releases/latest \
+            | jq -er '.tag_name | select(type == "string" and length > 0)')"
+
+          printf 'FRIDA_VERSION=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Split Repository Name
         id: split_name
@@ -43,46 +39,110 @@ jobs:
 
       - name: Check release version
         id: checkReleaseVersion
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            try {
-              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
-              const releaseResponse = await github.repos.getReleaseByTag({
-                owner: '${{ steps.split_name.outputs.owner }}',
-                repo: '${{ steps.split_name.outputs.repo }}',
-                tag: releaseVersion
-              });
-              const {
-                data: { tag_name: ver }
-              } = releaseResponse;
-              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
-                  if ( ${{ ( github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}){
-                    core.setOutput('ALREADY_RELEASE', '2');
-                  } else {
-                    core.setOutput('ALREADY_RELEASE', '1');
-                  }
-              }
-              else{
-                  core.setOutput('ALREADY_RELEASE', '0');
-              }
-            } catch (e) {
-              if(e.message == 'Not Found'){
-                core.setOutput('ALREADY_RELEASE', '0');
-              }
-              else{
-                core.setFailed(e.message);
-              }
-            }
-      
-      - name: Delete release
-        if: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE == '2' }}
-        uses: dev-drprasad/delete-tag-and-release@v1.0
-        with:
-          tag_name: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          delete_release: true
+        shell: bash
+        env:
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ['API_URL'].rstrip('/')
+          repository = quote(os.environ['REPOSITORY'], safe='/')
+          version = os.environ['RELEASE_VERSION']
+          url = f"{api_url}/repos/{repository}/releases/tags/{quote(version, safe='')}"
+          headers = {'Accept': 'application/json', 'User-Agent': 'Florida-release-check'}
+          if token := os.environ.get('REPO_TOKEN'):
+              headers['Authorization'] = f'Bearer {token}'
+
+          try:
+              with urlopen(Request(url, headers=headers), timeout=30) as response:
+                  release = json.load(response)
+          except HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f'Release lookup failed: HTTP {error.code}')
+              release = None
+
+          already_release = '0'
+          if release is not None and release['tag_name'] == version:
+              already_release = '2' if os.environ['EVENT_NAME'] in ('push', 'workflow_dispatch') else '1'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'ALREADY_RELEASE={already_release}\n')
+          PY
+
+      - name: Delete release and tag
+        # Also clean up a leftover tag if a previous run deleted only the release.
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import quote, urlsplit
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ['API_URL'].rstrip('/')
+          repository = quote(os.environ['REPOSITORY'], safe='/')
+          version = os.environ['RELEASE_VERSION']
+          token = os.environ.get('REPO_TOKEN')
+          if not token or not version:
+              raise SystemExit('A repository token and release version are required')
+
+          repo_url = f'{api_url}/repos/{repository}'
+          tag = quote(version, safe='')
+          headers = {
+              'Accept': 'application/json',
+              'User-Agent': 'Florida-release-cleanup',
+              'Authorization': f'Bearer {token}',
+          }
+
+          def request(method, path):
+              try:
+                  with urlopen(Request(repo_url + path, headers=headers, method=method), timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body) if body else None
+              except HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  try:
+                      message = json.load(error).get('message', error.reason)
+                  except (ValueError, AttributeError):
+                      message = error.reason
+                  raise SystemExit(f'{method} {path} failed: HTTP {error.code}: {message}')
+
+          release = request('GET', f'/releases/tags/{tag}')
+          if release is not None:
+              if release['tag_name'] != version:
+                  raise SystemExit('Release lookup returned an unexpected tag')
+              request('DELETE', f"/releases/{int(release['id'])}")
+              print(f'Release {version} removed')
+          else:
+              print(f'Release {version} is already absent')
+
+          # Gitea uses /tags; GitHub uses /git/ref for lookup and /git/refs for deletion.
+          is_gitea = urlsplit(api_url).path.rstrip('/').endswith('/api/v1')
+          lookup_path = f'/tags/{tag}' if is_gitea else f'/git/ref/tags/{tag}'
+          delete_path = f'/tags/{tag}' if is_gitea else f'/git/refs/tags/{tag}'
+          if request('GET', lookup_path) is not None:
+              request('DELETE', delete_path)
+              print(f'Tag {version} removed')
+          else:
+              print(f'Tag {version} is already absent')
+          PY
 
   create_release:
     needs: check_version
@@ -179,27 +239,55 @@ jobs:
 
     - name: Check release version
       id: checkReleaseVersion
-      uses: actions/github-script@v3
-      with:
-        github-token: ${{secrets.GITHUB_TOKEN}}
-        script: |
-          try {
-            const releaseVersion = '${{ needs.check_version.outputs.FRIDA_VERSION }}'
-            const releaseResponse = await github.repos.getReleaseByTag({
-              owner: '${{ steps.split_name.outputs.owner }}',
-              repo: '${{ steps.split_name.outputs.repo }}',
-              tag: releaseVersion
-            })
-            const {
-              data: { id: releaseId, html_url: htmlUrl, upload_url: uploadUrl }
-            } = releaseResponse;
-            core.setOutput('id', releaseId);
-            core.setOutput('html_url', htmlUrl);
-            core.setOutput('upload_url', uploadUrl);
-            core.setOutput('version', releaseVersion);
-          } catch (e) {
-            core.setFailed(e.message);
-          }
+      shell: bash
+      env:
+        API_URL: ${{ github.api_url }}
+        REPOSITORY: ${{ github.repository }}
+        REPO_TOKEN: ${{ github.token }}
+        RELEASE_VERSION: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        from urllib.error import HTTPError
+        from urllib.parse import quote
+        from urllib.request import Request, urlopen
+
+        api_url = os.environ['API_URL'].rstrip('/')
+        repository = quote(os.environ['REPOSITORY'], safe='/')
+        version = os.environ['RELEASE_VERSION']
+        url = f"{api_url}/repos/{repository}/releases/tags/{quote(version, safe='')}"
+        headers = {'Accept': 'application/json', 'User-Agent': 'Florida-release-check'}
+        if token := os.environ.get('REPO_TOKEN'):
+            headers['Authorization'] = f'Bearer {token}'
+
+        try:
+            with urlopen(Request(url, headers=headers), timeout=30) as response:
+                release = json.load(response)
+        except HTTPError as error:
+            raise SystemExit(f'Release lookup failed: HTTP {error.code}')
+
+        if release['tag_name'] != version:
+            raise SystemExit('Release lookup returned an unexpected tag')
+
+        release_id = int(release['id'])
+        upload_url = release.get('upload_url') or f'{api_url}/repos/{repository}/releases/{release_id}/assets'
+        # Octokit needs a URI template to put the asset name in the query string.
+        # Gitea returns a plain upload URL, while GitHub includes the template.
+        if '{' not in upload_url:
+            upload_url += '{&name,label}' if '?' in upload_url else '{?name,label}'
+        outputs = {
+            'id': release_id,
+            'html_url': release['html_url'],
+            'upload_url': upload_url,
+            'version': version,
+        }
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+            for key, value in outputs.items():
+                if '\n' in str(value) or '\r' in str(value):
+                    raise SystemExit(f'Invalid multiline release field: {key}')
+                output.write(f'{key}={value}\n')
+        PY
 
     - name: package build result for Android
       shell: bash
